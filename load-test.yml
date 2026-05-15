@@ -1,0 +1,15 @@
+config:
+  target: "http://localhost:3001"
+  phases:
+    - duration: 10
+      arrivalRate: 50
+
+scenarios:
+  - flow:
+      - post:
+          url: "/api/v1/logs"
+          json:
+            service: "load-test-service"
+            message: "High traffic log event"
+            level: "info"
+            traceId: "550e8400-e29b-41d4-a716-446655440000"

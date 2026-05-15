@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  # ── Redis ────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: log-intel-redis
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  # ── MongoDB ──────────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: log-intel-mongo
+    ports:
+      - '27017:27017'
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  mongo-data:
