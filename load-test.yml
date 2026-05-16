@@ -1,32 +1,15 @@
-<<<<<<< HEAD
 config:
   target: "http://localhost:3001"
   phases:
     - duration: 10
-      arrivalRate: 50
+      arrivalRate: 300
 
 scenarios:
   - flow:
       - post:
           url: "/api/v1/logs"
           json:
-            service: "load-test-service"
-            message: "High traffic log event"
+            service: "auth-service"
+            message: "Load test log"
             level: "info"
-=======
-config:
-  target: "http://localhost:3001"
-  phases:
-    - duration: 10
-      arrivalRate: 50
-
-scenarios:
-  - flow:
-      - post:
-          url: "/api/v1/logs"
-          json:
-            service: "load-test-service"
-            message: "High traffic log event"
-            level: "info"
->>>>>>> 6ede46c47e3f843ec3e84f4e961561a105235c00
             traceId: "550e8400-e29b-41d4-a716-446655440000"

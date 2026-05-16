@@ -23,6 +23,30 @@ const config = {
   consumerName: process.env.CONSUMER_NAME || 'worker-1',
   batchSize: parseInt(process.env.BATCH_SIZE, 10) || 10,
   blockTimeoutMs: parseInt(process.env.BLOCK_TIMEOUT_MS, 10) || 5000,
+
+  // ── Time Bucket Analytics ─────────────────────────────
+  // Per-minute Redis hash buckets for real-time service metrics.
+  timeBucket: {
+    keyPrefix: process.env.TB_KEY_PREFIX || 'tb',           // Redis key prefix
+    ttlSeconds: parseInt(process.env.TB_TTL_SECONDS, 10) || 180, // 3 min safety TTL
+    flushIntervalMs: parseInt(process.env.TB_FLUSH_INTERVAL_MS, 10) || 60_000, // flusher cycle
+  },
+
+  // ── Alert Detection (Phase 2A) ────────────────────────
+  // Periodic error-rate evaluation against time bucket data.
+  alerting: {
+    evalIntervalMs: parseInt(process.env.ALERT_EVAL_INTERVAL_MS, 10) || 30_000,  // evaluate every 30s
+    cooldownSeconds: parseInt(process.env.ALERT_COOLDOWN_SECONDS, 10) || 300,    // 5 min cooldown per service
+    cooldownKeyPrefix: process.env.ALERT_CD_PREFIX || 'alert:cd',                // Redis cooldown key prefix
+    minRequestThreshold: parseInt(process.env.ALERT_MIN_REQUESTS, 10) || 100,    // min total before evaluating
+
+    // Error rate (%) thresholds — evaluated highest-first
+    thresholds: {
+      WARNING:  parseFloat(process.env.ALERT_WARN_PCT)  || 2,
+      CRITICAL: parseFloat(process.env.ALERT_CRIT_PCT)  || 5,
+      SEVERE:   parseFloat(process.env.ALERT_SEVERE_PCT) || 10,
+    },
+  },
 };
 
 module.exports = config;

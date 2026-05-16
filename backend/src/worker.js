@@ -11,7 +11,8 @@
  *   2. Connect to Redis
  *   3. Connect to MongoDB
  *   4. Create / verify consumer group
- *   5. Enter the processing loop (XREADGROUP → normalise → insert → XACK)
+ *   5. Start alert evaluator (periodic, decoupled from log pipeline)
+ *   6. Enter the processing loop (XREADGROUP → normalise → insert → XACK)
  */
 
 // Load .env before anything else
@@ -20,6 +21,7 @@ require('./config');
 const { createRedisClient } = require('./db/redis');
 const { connect: connectMongo, disconnect: disconnectMongo } = require('./db/mongo');
 const { ensureConsumerGroup, processLogs } = require('./workers/logConsumer');
+const { startAlertEvaluator } = require('./services/alertEvaluator');
 
 async function main() {
   console.log('═══════════════════════════════════════════════════════');
@@ -41,16 +43,30 @@ async function main() {
   // ── 3. Consumer group ───────────────────────────────────
   await ensureConsumerGroup(redisRef);
 
-  // ── 4. Start processing ─────────────────────────────────
+  // ── 4. Start alert evaluator (decoupled) ────────────────
+  // Runs on a periodic interval, completely independent of the
+  // log processing loop below. Scans Redis buckets for error rate
+  // threshold breaches and persists alerts to MongoDB.
+  alertIntervalRef = startAlertEvaluator(redisRef);
+
+  // ── 5. Start processing ─────────────────────────────────
+  // NOTE: processLogs() blocks forever (infinite XREADGROUP loop).
+  // The alert evaluator runs alongside it via setInterval.
   console.log('');
   await processLogs(redisRef);
 }
 
 // ── Graceful shutdown ───────────────────────────────────────
 let redisRef;
+let alertIntervalRef;
 
 async function shutdown(signal) {
   console.log(`\n🛑 Received ${signal} — shutting down worker…`);
+  // Clear alert evaluator interval first
+  if (alertIntervalRef) {
+    clearInterval(alertIntervalRef);
+    console.log('🔕 Alert evaluator stopped');
+  }
   try {
     if (redisRef) await redisRef.quit();
   } catch { /* ignore */ }

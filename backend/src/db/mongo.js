@@ -12,6 +12,9 @@ let db;
 /** @type {import('mongodb').Collection} */
 let logsCollection;
 
+/** @type {import('mongodb').Collection} */
+let alertsCollection;
+
 /**
  * Connect to MongoDB and cache the client, db, and collection references.
  * Safe to call multiple times — returns immediately if already connected.
@@ -26,11 +29,18 @@ async function connect() {
   // so the code is self-documenting.
   db = client.db('log-intelligence');
   logsCollection = db.collection('logs');
+  alertsCollection = db.collection('alerts');
 
   // Create an index on traceId for fast lookups (idempotent)
   await logsCollection.createIndex({ traceId: 1 });
   // Create an index on timestamp for time-range queries
   await logsCollection.createIndex({ timestamp: -1 });
+
+  // ── Alert indexes (Phase 2A) ─────────────────────────
+  // Compound index: query alerts by service + time range
+  await alertsCollection.createIndex({ service: 1, timestamp: -1 });
+  // Index: filter/sort alerts by severity
+  await alertsCollection.createIndex({ severity: 1, timestamp: -1 });
 
   console.log('✅ MongoDB connected — database: log-intelligence');
   return db;
@@ -47,6 +57,16 @@ async function insertLog(logDoc) {
 }
 
 /**
+ * Insert a single alert document into the `alerts` collection.
+ *
+ * @param {object} alertDoc — alert document from alertEvaluator
+ * @returns {Promise<import('mongodb').InsertOneResult>}
+ */
+async function insertAlert(alertDoc) {
+  return alertsCollection.insertOne(alertDoc);
+}
+
+/**
  * Gracefully close the MongoDB connection.
  */
 async function disconnect() {
@@ -59,4 +79,4 @@ async function disconnect() {
   }
 }
 
-module.exports = { connect, insertLog, disconnect };
+module.exports = { connect, insertLog, insertAlert, disconnect };

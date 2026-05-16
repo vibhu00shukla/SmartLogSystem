@@ -1,0 +1,9 @@
+service,level
+auth-service,info
+auth-service,error
+payment-api,info
+payment-api,error
+db-service,error
+notification-service,info
+search-service,error
+analytics-service,info

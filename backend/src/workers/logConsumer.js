@@ -3,6 +3,7 @@
 const config = require('../config');
 const { normaliseLog } = require('./logNormaliser');
 const { insertLog } = require('../db/mongo');
+const { updateBucket } = require('../services/bucketAggregator');
 
 /**
  * Ensure the consumer group exists on the stream.
@@ -74,6 +75,16 @@ async function processLogs(redis) {
           // ── Insert into MongoDB ────────────────────────────
           await insertLog(logDoc);
           console.log(`💾 Inserted  [${entryId}]  into MongoDB`);
+
+          // ── Update time bucket (best-effort) ───────────────
+          // Increments per-minute Redis hash counters for this service.
+          // Wrapped in try/catch so a Redis hiccup doesn't block the
+          // main pipeline — bucket analytics are non-critical.
+          try {
+            await updateBucket(redis, logDoc);
+          } catch (bucketErr) {
+            console.error(`⚠️  Bucket update failed [${entryId}]:`, bucketErr.message);
+          }
 
           // ── ACK only after successful insert ───────────────
           await redis.xack(config.streamName, config.consumerGroup, entryId);
