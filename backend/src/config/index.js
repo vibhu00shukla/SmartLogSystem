@@ -73,8 +73,8 @@ const config = {
     adaptiveCooldownSeconds: parseInt(process.env.EWMA_CD_SECONDS, 10) || 300,    // adaptive cooldown TTL
   },
 
-  // ── Latency Analytics (Phase 5A) ──────────────────────
-  // Per-service latency sliding windows using Redis Sorted Sets.
+  // ── Latency Analytics (Phase 5A/5B) ──────────────────────
+  // Per-service and per-endpoint latency sliding windows using Redis Sorted Sets.
   // Stores latency samples for percentile computation (P50/P95/P99).
   latency: {
     keyPrefixes: {
@@ -83,6 +83,33 @@ const config = {
       externalApiTime: process.env.LAT_EXT_PREFIX     || 'lat:ext',    // external API time ZSET prefix
     },
     windowSeconds: parseInt(process.env.LAT_WINDOW_SECONDS, 10) || 60,  // rolling window for latency samples
+
+    // Endpoint registries (Phase 5B)
+    registry: {
+      servicesKey: process.env.EP_SERVICES_KEY || 'ep:services',
+      endpointsPrefix: process.env.EP_ENDPOINTS_PREFIX || 'ep:endpoints',
+      ttlSeconds: parseInt(process.env.EP_REGISTRY_TTL, 10) || 86400, // 24 hours to expire stale endpoints
+    },
+
+    // Endpoint Alerting & Intelligence (Phase 5C)
+    alerting: {
+      p95: {
+        warning: 500,
+        critical: 2000,
+        severe: 5000,
+      },
+      p99: {
+        tailSpike: 10000,
+      },
+      correlationErrorRate: 5, // % error rate required for INCIDENT correlation
+      cooldownSeconds: 1800, // 30 mins cooldown for endpoint alerts
+    },
+
+    ewma: {
+      alpha: 0.5,
+      deviationMultiplier: 3.0, // alert if P50 >= 3x baseline
+      ttlSeconds: 172800, // 48 hours TTL to prevent memory leaks from stale endpoints
+    }
   },
 };
 

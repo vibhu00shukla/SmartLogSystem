@@ -37,24 +37,26 @@
  */
 
 const config = require('../config');
+const { registerEndpoint } = require('./endpointRegistry');
 
 // ─────────────────────────────────────────────────────────────
 // Key Helpers
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Build the Redis ZSET key for a specific latency type and service.
+ * Build the Redis ZSET key for a specific latency type, service, and optionally endpoint.
  *
  * @param {string} type — one of: 'responseTime', 'dbQueryTime', 'externalApiTime'
  * @param {string} service — e.g. "auth-service"
- * @returns {string} — e.g. "lat:resp:auth-service"
+ * @param {string} [endpoint] — e.g. "/api/v1/login"
+ * @returns {string} — e.g. "lat:resp:auth-service" or "lat:resp:auth-service:/api/v1/login"
  */
-function getLatencyKey(type, service) {
+function getLatencyKey(type, service, endpoint = null) {
   const prefix = config.latency.keyPrefixes[type];
   if (!prefix) {
     throw new Error(`Unknown latency type: ${type}`);
   }
-  return `${prefix}:${service}`;
+  return endpoint ? `${prefix}:${service}:${endpoint}` : `${prefix}:${service}`;
 }
 
 /**
@@ -68,7 +70,7 @@ const LATENCY_FIELDS = ['responseTime', 'dbQueryTime', 'externalApiTime'];
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Record latency samples into per-service Redis ZSETs.
+ * Record latency samples into per-service and per-endpoint Redis ZSETs.
  *
  * Called once per processed log, right after recordEvent().
  * Only creates a pipeline if at least one latency field is present
@@ -78,6 +80,8 @@ const LATENCY_FIELDS = ['responseTime', 'dbQueryTime', 'externalApiTime'];
  * For each present latency field:
  *   1. ZADD lat:{type}:{service} {timestamp_ms} "{streamId}:{latencyMs}"
  *   2. ZREMRANGEBYSCORE lat:{type}:{service} -inf {cutoff} (cleanup)
+ *   3. If endpoint exists: ZADD lat:{type}:{service}:{endpoint} ...
+ *   4. If endpoint exists: ZREMRANGEBYSCORE lat:{type}:{service}:{endpoint} ...
  *
  * Member format: "{streamId}:{latencyMs}"
  *   - streamId provides uniqueness (already globally unique)
@@ -87,11 +91,11 @@ const LATENCY_FIELDS = ['responseTime', 'dbQueryTime', 'externalApiTime'];
  * @param {import('ioredis').Redis} redis — ioredis client
  * @param {object} logDoc — normalised log document
  *   Must have: .service, .timestamp, ._streamId
- *   Optional:  .responseTime, .dbQueryTime, .externalApiTime
+ *   Optional:  .responseTime, .dbQueryTime, .externalApiTime, .endpoint
  * @returns {Promise<void>}
  */
 async function recordLatency(redis, logDoc) {
-  const { service, timestamp, _streamId } = logDoc;
+  const { service, endpoint, timestamp, _streamId } = logDoc;
 
   // ── Check which latency fields are present ────────────────
   // Build a list of [fieldName, value] pairs for only the fields
@@ -111,24 +115,33 @@ async function recordLatency(redis, logDoc) {
   // Convert ISO timestamp to epoch milliseconds for the ZSET score
   const scoreMs = new Date(timestamp).getTime();
 
-  // Compute the cutoff timestamp for cleanup (now - windowSeconds)
-  const cutoffMs = Date.now() - (config.latency.windowSeconds * 1000);
+  // Compute the cutoff timestamp for cleanup with a retention buffer (+60s)
+  // to prevent race conditions where telemetry expires before the evaluator observes it.
+  const retentionMs = (config.latency.windowSeconds + 60) * 1000;
+  const cutoffMs = Date.now() - retentionMs;
 
   // ── Redis Pipeline ──────────────────────────────────────
   // Batch all commands into a single round-trip.
   const pipeline = redis.pipeline();
 
   for (const [field, value] of presentFields) {
-    const key = getLatencyKey(field, service);
-
-    // Member = "{streamId}:{latencyMs}" — latency encoded for extraction
+    // 1. Service-level recording
+    const svcKey = getLatencyKey(field, service);
     const member = `${_streamId}:${value}`;
+    pipeline.zadd(svcKey, scoreMs, member);
+    pipeline.zremrangebyscore(svcKey, '-inf', cutoffMs);
 
-    // 1. Record the latency sample
-    pipeline.zadd(key, scoreMs, member);
+    // 2. Endpoint-level recording (Phase 5B)
+    if (endpoint) {
+      const epKey = getLatencyKey(field, service, endpoint);
+      pipeline.zadd(epKey, scoreMs, member);
+      pipeline.zremrangebyscore(epKey, '-inf', cutoffMs);
+    }
+  }
 
-    // 2. Cleanup: remove samples older than the window
-    pipeline.zremrangebyscore(key, '-inf', cutoffMs);
+  // Register the endpoint in the registry if it exists
+  if (endpoint) {
+    registerEndpoint(pipeline, service, endpoint, scoreMs);
   }
 
   // Execute the pipeline
@@ -136,8 +149,9 @@ async function recordLatency(redis, logDoc) {
 
   // Log which fields were recorded (compact format)
   const summary = presentFields.map(([f, v]) => `${f}=${v}ms`).join(' ');
+  const epDisplay = endpoint ? `[${endpoint}] ` : '';
   console.log(
-    `⏱️  Latency recorded [${service}] ${summary}`
+    `⏱️  Latency recorded [${service}] ${epDisplay}${summary}`
   );
 }
 
@@ -177,7 +191,7 @@ function percentile(sorted, p) {
 }
 
 /**
- * Compute P50, P95, P99 for all latency types for a given service.
+ * Compute P50, P95, P99 for all latency types for a given service (and optional endpoint).
  *
  * For each latency type (responseTime, dbQueryTime, externalApiTime):
  *   1. ZRANGEBYSCORE to get all members in the 60s window
@@ -185,14 +199,12 @@ function percentile(sorted, p) {
  *   3. Sort numerically (ascending)
  *   4. Compute P50, P95, P99 using nearest-rank method
  *
- * At 300 req/s × 60s = 18,000 entries, the in-memory sort takes ~1ms.
- * This runs every 30s in the evaluator — trivial overhead.
- *
  * @param {import('ioredis').Redis} redis
  * @param {string} service — service name
+ * @param {string} [endpoint] — optional endpoint path
  * @returns {Promise<object|null>} — percentile metrics or null if no data
  */
-async function computePercentiles(redis, service) {
+async function computePercentiles(redis, service, endpoint = null) {
   const now = Date.now();
   const windowMs = config.latency.windowSeconds * 1000;
   const from = now - windowMs;
@@ -201,7 +213,7 @@ async function computePercentiles(redis, service) {
   let hasData = false;
 
   for (const field of LATENCY_FIELDS) {
-    const key = getLatencyKey(field, service);
+    const key = getLatencyKey(field, service, endpoint);
 
     // Fetch all members in the time window (score range)
     const members = await redis.zrangebyscore(key, from, '+inf');
@@ -247,14 +259,17 @@ async function computePercentiles(redis, service) {
  *
  * @param {import('ioredis').Redis} redis
  * @param {string} service
+ * @param {string} [endpoint]
  * @returns {Promise<void>}
  */
-async function cleanupLatencyWindows(redis, service) {
-  const cutoffMs = Date.now() - (config.latency.windowSeconds * 1000);
+async function cleanupLatencyWindows(redis, service, endpoint = null) {
+  // Add a retention buffer so data remains available for the evaluator loop
+  const retentionMs = (config.latency.windowSeconds + 60) * 1000;
+  const cutoffMs = Date.now() - retentionMs;
 
   const pipeline = redis.pipeline();
   for (const field of LATENCY_FIELDS) {
-    const key = getLatencyKey(field, service);
+    const key = getLatencyKey(field, service, endpoint);
     pipeline.zremrangebyscore(key, '-inf', cutoffMs);
   }
   await pipeline.exec();

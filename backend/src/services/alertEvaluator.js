@@ -65,6 +65,10 @@ const {
   computePercentiles,
   cleanupLatencyWindows,
 } = require('./latencyAggregator');
+const {
+  getEndpointsForService,
+  cleanupRegistries,
+} = require('./endpointRegistry');
 
 // ─────────────────────────────────────────────────────────────
 // Severity Ranking
@@ -358,69 +362,67 @@ async function evaluateService(redis, service) {
   // with 5 requests where 1 is an error (20%) would poison the baseline.
   if (total < config.alerting.minRequestThreshold) {
     console.log(
-      `   ⏭️  [${service}] total=${total} < ${config.alerting.minRequestThreshold} min threshold (window=${windowSeconds}s) — skipping`
+      `   ⏭️  [${service}] total=${total} < ${config.alerting.minRequestThreshold} min threshold (window=${windowSeconds}s) — skipping alerts/EWMA`
     );
-    return;
-  }
+  } else {
+    // ── 4. Compute error rate ─────────────────────────────────
+    const errorRate = (errors / total) * 100;
 
-  // ── 4. Compute error rate ─────────────────────────────────
-  const errorRate = (errors / total) * 100;
-
-  // ── 5. Update EWMA baseline (ALWAYS runs) ─────────────────
-  // The baseline learns from every evaluation cycle where we have
-  // enough traffic. This happens regardless of whether any alert
-  // fires — the system is always learning "normal" behavior.
-  let ewmaResult;
-  try {
-    ewmaResult = await updateBaseline(redis, service, errorRate);
-    console.log(
-      `   📊 EWMA [${service}] rate=${errorRate.toFixed(2)}% ` +
-      `baseline=${ewmaResult.previousBaseline.toFixed(2)}→${ewmaResult.baseline.toFixed(2)}% ` +
-      `samples=${ewmaResult.samples} α=${config.ewma.alpha}`
-    );
-  } catch (ewmaErr) {
-    // EWMA update failure must NOT block threshold alerts.
-    // Log and continue — threshold alerting is more critical.
-    console.error(
-      `   ⚠️  EWMA update failed for [${service}]:`, ewmaErr.message
-    );
-    ewmaResult = null;
-  }
-
-  // ── 6. Path 1: Fixed threshold alerting ───────────────────
-  // Exact same logic as Phase 2A, now in a named helper function.
-  // Has its own cooldown: alert:cd:{service}
-  try {
-    await handleThresholdAlert(redis, service, errorRate, total, errors, windowSeconds);
-  } catch (threshErr) {
-    console.error(
-      `   ❌ Threshold alert handling failed for [${service}]:`, threshErr.message
-    );
-  }
-
-  // ── 7. Path 2: Adaptive anomaly alerting ──────────────────
-  // Only runs if EWMA was updated successfully.
-  // Has its own cooldown: alert:cd:adp:{service}
-  if (ewmaResult) {
+    // ── 5. Update EWMA baseline (ALWAYS runs) ─────────────────
+    // The baseline learns from every evaluation cycle where we have
+    // enough traffic. This happens regardless of whether any alert
+    // fires — the system is always learning "normal" behavior.
+    let ewmaResult;
     try {
-      await handleAdaptiveAlert(redis, service, errorRate, total, errors, windowSeconds, ewmaResult);
-    } catch (adaptiveErr) {
-      console.error(
-        `   ❌ Adaptive alert handling failed for [${service}]:`, adaptiveErr.message
+      ewmaResult = await updateBaseline(redis, service, errorRate);
+      console.log(
+        `   📊 EWMA [${service}] rate=${errorRate.toFixed(2)}% ` +
+        `baseline=${ewmaResult.previousBaseline.toFixed(2)}→${ewmaResult.baseline.toFixed(2)}% ` +
+        `samples=${ewmaResult.samples} α=${config.ewma.alpha}`
       );
+    } catch (ewmaErr) {
+      // EWMA update failure must NOT block threshold alerts.
+      // Log and continue — threshold alerting is more critical.
+      console.error(
+        `   ⚠️  EWMA update failed for [${service}]:`, ewmaErr.message
+      );
+      ewmaResult = null;
+    }
+
+    // ── 6. Path 1: Fixed threshold alerting ───────────────────
+    // Exact same logic as Phase 2A, now in a named helper function.
+    // Has its own cooldown: alert:cd:{service}
+    try {
+      await handleThresholdAlert(redis, service, errorRate, total, errors, windowSeconds);
+    } catch (threshErr) {
+      console.error(
+        `   ❌ Threshold alert handling failed for [${service}]:`, threshErr.message
+      );
+    }
+
+    // ── 7. Path 2: Adaptive anomaly alerting ──────────────────
+    // Only runs if EWMA was updated successfully.
+    // Has its own cooldown: alert:cd:adp:{service}
+    if (ewmaResult) {
+      try {
+        await handleAdaptiveAlert(redis, service, errorRate, total, errors, windowSeconds, ewmaResult);
+      } catch (adaptiveErr) {
+        console.error(
+          `   ❌ Adaptive alert handling failed for [${service}]:`, adaptiveErr.message
+        );
+      }
     }
   }
 
-  // ── 8. Path 3: Latency percentiles (Phase 5A — logging only) ─
-  // Compute P50/P95/P99 for all latency types. No alerting yet —
-  // that comes in Phase 5B. This path validates the latency pipeline
-  // and provides visibility into service performance.
+  // ── 8. Path 3: Latency percentiles (Phase 5A/5B — logging only) ─
+  // Compute P50/P95/P99 for all latency types at the service level,
+  // and then iterate over active endpoints for endpoint-level metrics.
   try {
+    // Service-level latency
     await cleanupLatencyWindows(redis, service);
     const latencyMetrics = await computePercentiles(redis, service);
 
     if (latencyMetrics) {
-      // Log each latency type that has data
       for (const [field, metrics] of Object.entries(latencyMetrics)) {
         if (metrics) {
           console.log(
@@ -431,6 +433,28 @@ async function evaluateService(redis, service) {
         }
       }
     }
+
+    // Endpoint-level latency (Phase 5B)
+    await cleanupRegistries(redis, service);
+    const endpoints = await getEndpointsForService(redis, service);
+
+    for (const endpoint of endpoints) {
+      await cleanupLatencyWindows(redis, service, endpoint);
+      const epMetrics = await computePercentiles(redis, service, endpoint);
+
+      if (epMetrics) {
+        for (const [field, metrics] of Object.entries(epMetrics)) {
+          if (metrics) {
+            console.log(
+              `   📐 [${service}][${endpoint}] ${field}: ` +
+              `P50=${metrics.p50}ms P95=${metrics.p95}ms P99=${metrics.p99}ms ` +
+              `(min=${metrics.min}ms max=${metrics.max}ms samples=${metrics.samples})`
+            );
+          }
+        }
+      }
+    }
+
   } catch (latErr) {
     console.error(
       `   ⚠️  Latency percentile calc failed for [${service}]:`, latErr.message
