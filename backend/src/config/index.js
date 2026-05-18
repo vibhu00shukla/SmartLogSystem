@@ -103,6 +103,7 @@ const config = {
       },
       correlationErrorRate: 5, // % error rate required for INCIDENT correlation
       cooldownSeconds: 1800, // 30 mins cooldown for endpoint alerts
+      minEndpointThreshold: parseInt(process.env.MIN_ENDPOINT_REQUESTS_PER_WINDOW, 10) || 20, // min requests per endpoint to trigger intelligence
     },
 
     ewma: {
@@ -110,6 +111,17 @@ const config = {
       deviationMultiplier: 3.0, // alert if P50 >= 3x baseline
       ttlSeconds: 172800, // 48 hours TTL to prevent memory leaks from stale endpoints
     }
+  },
+
+  // ── Distributed Tracing (Phase 6A) ──────────────────────
+  tracing: {
+    keyPrefixes: {
+      active: 'trace:active',     // ZSET of active traces
+      events: 'trace:events',     // prefix for trace event LISTs
+    },
+    closureTimeoutSeconds: parseInt(process.env.TRACE_CLOSURE_TIMEOUT, 10) || 15, // trace assumed complete if idle for 15s
+    evaluatorIntervalMs: parseInt(process.env.TRACE_EVALUATOR_INTERVAL, 10) || 5000, // sweeping interval (5s)
+    fallbackTtlSeconds: 300, // 5 min memory-leak protection TTL for trace lists
   },
 };
 

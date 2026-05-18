@@ -69,6 +69,9 @@ const {
   getEndpointsForService,
   cleanupRegistries,
 } = require('./endpointRegistry');
+const {
+  evaluateEndpoint,
+} = require('./endpointAlerting');
 
 // ─────────────────────────────────────────────────────────────
 // Severity Ranking
@@ -434,16 +437,22 @@ async function evaluateService(redis, service) {
       }
     }
 
-    // Endpoint-level latency (Phase 5B)
+    // Endpoint-level latency & intelligence (Phase 5B/5C)
     await cleanupRegistries(redis, service);
     const endpoints = await getEndpointsForService(redis, service);
 
     for (const endpoint of endpoints) {
+      // 1. Cleanup windows
       await cleanupLatencyWindows(redis, service, endpoint);
-      const epMetrics = await computePercentiles(redis, service, endpoint);
+      await cleanupWindow(redis, service, endpoint); // Error/Total tracking cleanup
 
-      if (epMetrics) {
-        for (const [field, metrics] of Object.entries(epMetrics)) {
+      // 2. Fetch metrics
+      const epLatencyMetrics = await computePercentiles(redis, service, endpoint);
+      const epMetrics = await getRollingMetrics(redis, service, endpoint);
+
+      // 3. Log metrics (Phase 5B)
+      if (epLatencyMetrics) {
+        for (const [field, metrics] of Object.entries(epLatencyMetrics)) {
           if (metrics) {
             console.log(
               `   📐 [${service}][${endpoint}] ${field}: ` +
@@ -452,6 +461,13 @@ async function evaluateService(redis, service) {
             );
           }
         }
+      }
+
+      // 4. Intelligence & Alerting (Phase 5C)
+      if (epLatencyMetrics && epMetrics.total >= config.latency.alerting.minEndpointThreshold) {
+        await evaluateEndpoint(redis, service, endpoint, epMetrics, epLatencyMetrics);
+      } else if (epLatencyMetrics) {
+         console.log(`   ⏭️  [${service}][${endpoint}] total=${epMetrics.total} < ${config.latency.alerting.minEndpointThreshold} min threshold — skipping intelligence`);
       }
     }
 

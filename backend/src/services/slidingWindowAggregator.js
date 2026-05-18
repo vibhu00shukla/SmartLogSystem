@@ -45,23 +45,29 @@ const config = require('../config');
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Build the Redis ZSET key for all events of a service.
+ * Build the Redis ZSET key for all events of a service (and optionally endpoint).
  *
  * @param {string} service — e.g. "auth-service"
- * @returns {string} — e.g. "sw:auth-service"
+ * @param {string} [endpoint] — e.g. "/login"
+ * @returns {string} — e.g. "sw:auth-service" or "sw:auth-service:/login"
  */
-function getAllEventsKey(service) {
-  return `${config.slidingWindow.keyPrefix}:${service}`;
+function getAllEventsKey(service, endpoint = null) {
+  return endpoint
+    ? `${config.slidingWindow.keyPrefix}:${service}:${endpoint}`
+    : `${config.slidingWindow.keyPrefix}:${service}`;
 }
 
 /**
- * Build the Redis ZSET key for error events of a service.
+ * Build the Redis ZSET key for error events of a service (and optionally endpoint).
  *
  * @param {string} service — e.g. "auth-service"
- * @returns {string} — e.g. "sw:auth-service:err"
+ * @param {string} [endpoint] — e.g. "/login"
+ * @returns {string} — e.g. "sw:auth-service:err" or "sw:auth-service:/login:err"
  */
-function getErrorEventsKey(service) {
-  return `${config.slidingWindow.keyPrefix}:${service}${config.slidingWindow.errorSuffix}`;
+function getErrorEventsKey(service, endpoint = null) {
+  return endpoint
+    ? `${config.slidingWindow.keyPrefix}:${service}:${endpoint}${config.slidingWindow.errorSuffix}`
+    : `${config.slidingWindow.keyPrefix}:${service}${config.slidingWindow.errorSuffix}`;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -80,13 +86,14 @@ function getErrorEventsKey(service) {
  *   4. ZREMRANGEBYSCORE sw:{service} -inf {cutoff}        — cleanup old events
  *   5. ZREMRANGEBYSCORE sw:{service}:err -inf {cutoff}    — cleanup old errors
  *
+ * If endpoint exists, repeats steps 1, 2, 4, 5 for the endpoint ZSETs.
+ *
  * @param {import('ioredis').Redis} redis — ioredis client
  * @param {object} logDoc — normalised log document
- *   Must have: .service, .level, .timestamp, ._streamId
  * @returns {Promise<void>}
  */
 async function recordEvent(redis, logDoc) {
-  const { service, level, timestamp, _streamId } = logDoc;
+  const { service, endpoint, level, timestamp, _streamId } = logDoc;
 
   // Convert ISO timestamp to epoch milliseconds for the ZSET score
   const scoreMs = new Date(timestamp).getTime();
@@ -121,16 +128,28 @@ async function recordEvent(redis, logDoc) {
   pipeline.sadd(registryKey, service);
 
   // 4. Cleanup: remove events older than the window
-  //    This keeps memory tight and runs efficiently — at steady state
-  //    each call removes ~5 entries (300 req/s / 60s ≈ 5 per insert).
   pipeline.zremrangebyscore(allKey, '-inf', cutoffMs);
   pipeline.zremrangebyscore(errKey, '-inf', cutoffMs);
+
+  // 5. Endpoint-level recording (Phase 5C)
+  if (endpoint) {
+    const epAllKey = getAllEventsKey(service, endpoint);
+    const epErrKey = getErrorEventsKey(service, endpoint);
+
+    pipeline.zadd(epAllKey, scoreMs, member);
+    if (isError) {
+      pipeline.zadd(epErrKey, scoreMs, member);
+    }
+    pipeline.zremrangebyscore(epAllKey, '-inf', cutoffMs);
+    pipeline.zremrangebyscore(epErrKey, '-inf', cutoffMs);
+  }
 
   // Execute the pipeline
   await pipeline.exec();
 
+  const epDisplay = endpoint ? `[${endpoint}] ` : '';
   console.log(
-    `🪟 Window updated  [${allKey}]  member=${member}  error=${isError}`
+    `🪟 Window updated  [${allKey}] ${epDisplay} member=${member}  error=${isError}`
   );
 }
 
@@ -139,7 +158,7 @@ async function recordEvent(redis, logDoc) {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Get rolling metrics for a service within the sliding window.
+ * Get rolling metrics for a service (and optional endpoint) within the sliding window.
  *
  * Uses ZCOUNT to count members whose score (timestamp) falls
  * within the [now - windowSeconds, now] range. This is O(log N)
@@ -147,11 +166,12 @@ async function recordEvent(redis, logDoc) {
  *
  * @param {import('ioredis').Redis} redis
  * @param {string} service — service name
+ * @param {string} [endpoint] — endpoint path
  * @returns {Promise<{ total: number, errors: number, windowSeconds: number }>}
  */
-async function getRollingMetrics(redis, service) {
-  const allKey = getAllEventsKey(service);
-  const errKey = getErrorEventsKey(service);
+async function getRollingMetrics(redis, service, endpoint = null) {
+  const allKey = getAllEventsKey(service, endpoint);
+  const errKey = getErrorEventsKey(service, endpoint);
 
   const now = Date.now();
   const windowMs = config.slidingWindow.windowSeconds * 1000;
@@ -194,12 +214,13 @@ async function getServiceRegistry(redis) {
  *
  * @param {import('ioredis').Redis} redis
  * @param {string} service
+ * @param {string} [endpoint]
  * @returns {Promise<void>}
  */
-async function cleanupWindow(redis, service) {
+async function cleanupWindow(redis, service, endpoint = null) {
   const cutoffMs = Date.now() - (config.slidingWindow.windowSeconds * 1000);
-  const allKey = getAllEventsKey(service);
-  const errKey = getErrorEventsKey(service);
+  const allKey = getAllEventsKey(service, endpoint);
+  const errKey = getErrorEventsKey(service, endpoint);
 
   const pipeline = redis.pipeline();
   pipeline.zremrangebyscore(allKey, '-inf', cutoffMs);

@@ -6,6 +6,7 @@ const { insertLog } = require('../db/mongo');
 const { updateBucket } = require('../services/bucketAggregator');
 const { recordEvent } = require('../services/slidingWindowAggregator');
 const { recordLatency } = require('../services/latencyAggregator');
+const { recordTraceEvent } = require('../services/traceAggregator');
 
 /**
  * Ensure the consumer group exists on the stream.
@@ -105,6 +106,13 @@ async function processLogs(redis) {
             await recordLatency(redis, logDoc);
           } catch (latErr) {
             console.error(`⚠️  Latency recording failed [${entryId}]:`, latErr.message);
+          }
+
+          // ── Record trace event (Phase 6A) ───────────────────
+          try {
+            await recordTraceEvent(redis, logDoc);
+          } catch (traceErr) {
+            console.error(`⚠️  Trace event recording failed [${entryId}]:`, traceErr.message);
           }
 
           // ── ACK only after successful insert ───────────────

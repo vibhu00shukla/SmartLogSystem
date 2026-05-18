@@ -22,6 +22,7 @@ const { createRedisClient } = require('./db/redis');
 const { connect: connectMongo, disconnect: disconnectMongo } = require('./db/mongo');
 const { ensureConsumerGroup, processLogs } = require('./workers/logConsumer');
 const { startAlertEvaluator } = require('./services/alertEvaluator');
+const { startTraceEvaluator } = require('./services/traceEvaluator');
 
 async function main() {
   console.log('═══════════════════════════════════════════════════════');
@@ -49,9 +50,13 @@ async function main() {
   // threshold breaches and persists alerts to MongoDB.
   alertIntervalRef = startAlertEvaluator(redisRef);
 
-  // ── 5. Start processing ─────────────────────────────────
+  // ── 5. Start trace evaluator (Phase 6A) ───────────────────
+  // Decoupled loop to sweep and construct distributed traces.
+  traceIntervalRef = startTraceEvaluator(redisRef);
+
+  // ── 6. Start processing ─────────────────────────────────
   // NOTE: processLogs() blocks forever (infinite XREADGROUP loop).
-  // The alert evaluator runs alongside it via setInterval.
+  // Evaluators run alongside it via setInterval.
   console.log('');
   await processLogs(redisRef);
 }
@@ -59,6 +64,7 @@ async function main() {
 // ── Graceful shutdown ───────────────────────────────────────
 let redisRef;
 let alertIntervalRef;
+let traceIntervalRef;
 
 async function shutdown(signal) {
   console.log(`\n🛑 Received ${signal} — shutting down worker…`);
@@ -66,6 +72,10 @@ async function shutdown(signal) {
   if (alertIntervalRef) {
     clearInterval(alertIntervalRef);
     console.log('🔕 Alert evaluator stopped');
+  }
+  if (traceIntervalRef) {
+    clearInterval(traceIntervalRef);
+    console.log('🔕 Trace evaluator stopped');
   }
   try {
     if (redisRef) await redisRef.quit();

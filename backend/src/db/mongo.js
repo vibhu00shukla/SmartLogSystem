@@ -15,6 +15,9 @@ let logsCollection;
 /** @type {import('mongodb').Collection} */
 let alertsCollection;
 
+/** @type {import('mongodb').Collection} */
+let traceSummariesCollection;
+
 /**
  * Connect to MongoDB and cache the client, db, and collection references.
  * Safe to call multiple times — returns immediately if already connected.
@@ -36,11 +39,16 @@ async function connect() {
   // Create an index on timestamp for time-range queries
   await logsCollection.createIndex({ timestamp: -1 });
 
-  // ── Alert indexes (Phase 2A) ─────────────────────────
-  // Compound index: query alerts by service + time range
-  await alertsCollection.createIndex({ service: 1, timestamp: -1 });
+  // ── Alert indexes ─────────────────────────
+  // Compound index: query alerts by service + endpoint + time range
+  await alertsCollection.createIndex({ service: 1, endpoint: 1, timestamp: -1 });
   // Index: filter/sort alerts by severity
   await alertsCollection.createIndex({ severity: 1, timestamp: -1 });
+
+  // ── Trace indexes (Phase 6A) ──────────────────────
+  traceSummariesCollection = db.collection('trace_summaries');
+  await traceSummariesCollection.createIndex({ traceId: 1 }, { unique: true });
+  await traceSummariesCollection.createIndex({ startTime: -1 });
 
   console.log('✅ MongoDB connected — database: log-intelligence');
   return db;
@@ -67,6 +75,15 @@ async function insertAlert(alertDoc) {
 }
 
 /**
+ * Insert a single trace summary document.
+ *
+ * @param {object} traceDoc
+ */
+async function insertTraceSummary(traceDoc) {
+  return traceSummariesCollection.insertOne(traceDoc);
+}
+
+/**
  * Gracefully close the MongoDB connection.
  */
 async function disconnect() {
@@ -75,8 +92,10 @@ async function disconnect() {
     client = null;
     db = null;
     logsCollection = null;
+    alertsCollection = null;
+    traceSummariesCollection = null;
     console.log('MongoDB connection closed');
   }
 }
 
-module.exports = { connect, insertLog, insertAlert, disconnect };
+module.exports = { connect, insertLog, insertAlert, insertTraceSummary, disconnect };
