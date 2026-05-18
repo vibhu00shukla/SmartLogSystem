@@ -1,37 +1,70 @@
 'use strict';
 
 /**
- * alertEvaluator.js — Error Rate Alert Detection Service
+ * alertEvaluator.js — Dual-Path Alert Detection Service
  *
- * Periodically scans Redis time buckets (tb:{service}:{minute}),
- * computes per-service error rates, and generates alert documents
- * when thresholds are breached.
+ * Periodically evaluates per-service error rates and generates alerts
+ * through TWO independent detection paths:
+ *
+ *   Path 1: FIXED THRESHOLD ALERTS (Phase 2A)
+ *     ≥2% → WARNING, ≥5% → CRITICAL, ≥10% → SEVERE
+ *     Cooldown key:  alert:cd:{service}
+ *     Alert type:    error_rate_threshold
+ *
+ *   Path 2: ADAPTIVE ANOMALY ALERTS (Phase 4)
+ *     EWMA baseline tracks "normal" error rate per service.
+ *     Fires when current rate ≥ 3× baseline AND rate ≥ 1%.
+ *     Cooldown key:  alert:cd:adp:{service}
+ *     Alert type:    adaptive_deviation
+ *
+ * Both paths run in every evaluation cycle. They have SEPARATE
+ * cooldown namespaces so one never suppresses the other.
+ *
+ * Data source: Rolling 60-second sorted sets (Phase 3).
  *
  * Architecture:
  *   • Runs on a 30-second setInterval, fully DECOUPLED from the
  *     log ingestion pipeline. The logConsumer is never touched.
- *   • Reads bucket hashes via HGETALL — atomic, no race with HINCRBY.
- *   • Uses Redis cooldown keys (alert:cd:{service}) with TTL to prevent
- *     repeated alerts for the same service.
- *   • Supports severity ESCALATION — if a service's error rate climbs
- *     from WARNING to SEVERE during an active cooldown, the cooldown
- *     is overridden and a new, higher-severity alert fires.
+ *   • Discovers services via the sw:services registry SET.
+ *   • Counts events via ZCOUNT on sorted sets — O(log N).
+ *   • Updates EWMA baseline on EVERY cycle (always learning).
+ *   • Supports severity ESCALATION for threshold alerts.
+ *   • Cold-start grace period for adaptive alerts (5 cycles).
  *
  * Redis keys used:
- *   READ:   tb:{service}:{YYYYMMDDHHmm}    (time bucket hashes)
- *   WRITE:  alert:cd:{service}              (cooldown keys with 5-min TTL)
+ *   READ:   sw:{service}            (all-events sorted set)
+ *   READ:   sw:{service}:err        (error-events sorted set)
+ *   READ:   sw:services             (service registry SET)
+ *   READ:   alert:cd:{service}      (threshold cooldown)
+ *   READ:   alert:cd:adp:{service}  (adaptive cooldown)
+ *   READ:   ewma:{service}          (EWMA baseline hash)
+ *   WRITE:  alert:cd:{service}      (threshold cooldown with TTL)
+ *   WRITE:  alert:cd:adp:{service}  (adaptive cooldown with TTL)
+ *   WRITE:  ewma:{service}          (EWMA baseline hash, no TTL)
  *
  * Failure model:
- *   • Each bucket is evaluated independently — one failure doesn't
+ *   • Each service is evaluated independently — one failure doesn't
  *     block others.
- *   • The entire evaluation cycle is wrapped in try/catch — a crash
- *     just means the next 30s tick retries.
+ *   • EWMA update failures don't block threshold alerts.
  *   • Alert persistence failures are logged but never propagated.
  */
 
 const config = require('../config');
 const { insertAlert } = require('../db/mongo');
-const { formatMinute } = require('./bucketAggregator');
+const {
+  getRollingMetrics,
+  getServiceRegistry,
+  cleanupWindow,
+} = require('./slidingWindowAggregator');
+const {
+  updateBaseline,
+  detectAnomaly,
+  getAdaptiveCooldownKey,
+} = require('./ewmaBaseline');
+const {
+  computePercentiles,
+  cleanupLatencyWindows,
+} = require('./latencyAggregator');
 
 // ─────────────────────────────────────────────────────────────
 // Severity Ranking
@@ -76,7 +109,7 @@ function computeSeverity(errorRate) {
 }
 
 /**
- * Build the Redis cooldown key for a given service.
+ * Build the Redis cooldown key for threshold alerts.
  *
  * @param {string} service
  * @returns {string} e.g. "alert:cd:auth-service"
@@ -85,116 +118,43 @@ function getCooldownKey(service) {
   return `${config.alerting.cooldownKeyPrefix}:${service}`;
 }
 
-/**
- * Parse a time bucket Redis key into its components.
- *
- * Key format: {prefix}:{service}:{YYYYMMDDHHmm}
- * The minute is always the last 12-char segment.
- * The service name may contain colons (defensive parsing).
- *
- * @param {string} key — e.g. "tb:auth-service:202605151135"
- * @returns {{ service: string, minute: string } | null}
- */
-function parseBucketKey(key) {
-  const prefix = config.timeBucket.keyPrefix;
-
-  // Strip the prefix and leading colon
-  if (!key.startsWith(prefix + ':')) return null;
-  const rest = key.slice(prefix.length + 1); // "auth-service:202605151135"
-
-  // The minute is always the last 12 characters (YYYYMMDDHHmm)
-  if (rest.length < 13) return null; // minimum: "x:202605151135" = 15 chars
-  const minute = rest.slice(-12);
-  const service = rest.slice(0, -(12 + 1)); // strip ":202605151135"
-
-  if (!service || !minute) return null;
-  return { service, minute };
-}
-
-/**
- * Check if a bucket minute is within the active TTL window.
- *
- * Only evaluates buckets created within the last `ttlSeconds` to avoid
- * processing stale/expired historical data unnecessarily.
- *
- * @param {string} minute — bucket minute string (YYYYMMDDHHmm)
- * @returns {boolean} — true if bucket is recent enough to evaluate
- */
-function isBucketRecent(minute) {
-  // Parse the minute string back to a Date (UTC)
-  const year  = parseInt(minute.slice(0, 4), 10);
-  const month = parseInt(minute.slice(4, 6), 10) - 1; // 0-indexed
-  const day   = parseInt(minute.slice(6, 8), 10);
-  const hour  = parseInt(minute.slice(8, 10), 10);
-  const min   = parseInt(minute.slice(10, 12), 10);
-
-  const bucketTime = new Date(Date.UTC(year, month, day, hour, min, 0));
-  const now = new Date();
-
-  // Bucket age in seconds
-  const ageSeconds = (now.getTime() - bucketTime.getTime()) / 1000;
-
-  // Only evaluate if within the TTL window
-  return ageSeconds <= config.timeBucket.ttlSeconds;
-}
-
 // ─────────────────────────────────────────────────────────────
-// Core Evaluation Logic
+// Path 1: Fixed Threshold Alerting (unchanged logic from Phase 2A)
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Evaluate a single time bucket and generate an alert if warranted.
+ * Handle fixed-threshold alert logic for a single service.
+ *
+ * This is the EXACT SAME logic from Phase 2A, extracted into a
+ * named function so the EWMA update and adaptive check can also
+ * run in the same evaluation cycle.
  *
  * Steps:
- *   1. HGETALL to read total, errors, start
- *   2. Check minimum request threshold
- *   3. Compute error rate and severity
- *   4. Check cooldown (with escalation support)
- *   5. Persist alert to MongoDB
- *   6. Set cooldown key with TTL
+ *   1. Compute severity from error rate
+ *   2. Check threshold cooldown (with escalation)
+ *   3. Persist alert to MongoDB
+ *   4. Set threshold cooldown
  *
  * @param {import('ioredis').Redis} redis
- * @param {string} bucketKey — e.g. "tb:auth-service:202605151135"
- * @param {string} service — service name
- * @param {string} minute — bucket minute string
+ * @param {string} service
+ * @param {number} errorRate — error rate (%)
+ * @param {number} total — total logs in window
+ * @param {number} errors — error logs in window
+ * @param {number} windowSeconds — window size
  * @returns {Promise<void>}
  */
-async function evaluateBucket(redis, bucketKey, service, minute) {
-  // ── 1. Read bucket data ──────────────────────────────────
-  const data = await redis.hgetall(bucketKey);
-
-  // Empty hash = key expired between SCAN and HGETALL (rare but possible)
-  if (!data || !data.total) {
-    return;
-  }
-
-  const total  = parseInt(data.total, 10);
-  const errors = parseInt(data.errors, 10) || 0;
-  const start  = data.start || null;
-
-  // ── 2. Minimum request threshold ─────────────────────────
-  // Don't evaluate services with too few requests — avoids false positives
-  // from low-traffic services (e.g., 1 error out of 2 requests = 50%).
-  if (total < config.alerting.minRequestThreshold) {
-    console.log(
-      `   ⏭️  [${service}] total=${total} < ${config.alerting.minRequestThreshold} min threshold — skipping`
-    );
-    return;
-  }
-
-  // ── 3. Compute error rate and severity ────────────────────
-  const errorRate = (errors / total) * 100;
+async function handleThresholdAlert(redis, service, errorRate, total, errors, windowSeconds) {
   const severity = computeSeverity(errorRate);
 
   if (!severity) {
-    // Below all thresholds — no alert needed
+    // Below all thresholds — no threshold alert needed
     console.log(
-      `   ✅ [${service}] errorRate=${errorRate.toFixed(2)}% — below thresholds`
+      `   ✅ [${service}] errorRate=${errorRate.toFixed(2)}% (${errors}/${total}) window=${windowSeconds}s — below thresholds`
     );
     return;
   }
 
-  // ── 4. Check cooldown with escalation ─────────────────────
+  // ── Check cooldown with escalation ────────────────────────
   const cooldownKey = getCooldownKey(service);
   const existingCooldown = await redis.get(cooldownKey);
 
@@ -216,41 +176,36 @@ async function evaluateBucket(redis, bucketKey, service, minute) {
     );
   }
 
-  // ── 5. Build and persist alert document ───────────────────
+  // ── Build and persist alert document ──────────────────────
   const now = new Date().toISOString();
 
   const alertDoc = {
     service,
     severity,
-    errorRate:    parseFloat(errorRate.toFixed(4)),
-    totalLogs:    total,
-    errorLogs:    errors,
-    timestamp:    now,
-    bucketKey,
-    alertType:    'error_rate_threshold',
-    bucketMinute: minute,
-    bucketStart:  start,
-    evaluatedAt:  now,
+    errorRate:     parseFloat(errorRate.toFixed(4)),
+    totalLogs:     total,
+    errorLogs:     errors,
+    timestamp:     now,
+    alertType:     'error_rate_threshold',
+    dataSource:    'sliding_window',
+    windowSeconds,
+    evaluatedAt:   now,
   };
 
   try {
     const result = await insertAlert(alertDoc);
     console.log(
       `   🚨 ALERT [${severity}] service=${service} errorRate=${errorRate.toFixed(2)}% ` +
-      `(${errors}/${total}) — persisted as ${result.insertedId}`
+      `(${errors}/${total}) window=${windowSeconds}s — persisted as ${result.insertedId}`
     );
   } catch (dbErr) {
-    // Alert persistence failure must NOT break the evaluation cycle.
-    // Log and continue — the next cycle will re-evaluate.
     console.error(
-      `   ❌ Failed to persist alert for [${service}]:`, dbErr.message
+      `   ❌ Failed to persist threshold alert for [${service}]:`, dbErr.message
     );
     return; // Don't set cooldown if persistence failed — allows retry
   }
 
-  // ── 6. Set cooldown — prevents repeated alerts ────────────
-  // Store the severity as the value so escalation logic can compare.
-  // EX = TTL in seconds. Key auto-expires after cooldown period.
+  // ── Set threshold cooldown ────────────────────────────────
   await redis.set(
     cooldownKey,
     severity,
@@ -259,72 +214,268 @@ async function evaluateBucket(redis, bucketKey, service, minute) {
   );
 
   console.log(
-    `   🔕 Cooldown set: ${cooldownKey} = ${severity} (TTL=${config.alerting.cooldownSeconds}s)`
+    `   🔕 Threshold cooldown set: ${cooldownKey} = ${severity} (TTL=${config.alerting.cooldownSeconds}s)`
   );
 }
 
+// ─────────────────────────────────────────────────────────────
+// Path 2: Adaptive Anomaly Alerting (Phase 4)
+// ─────────────────────────────────────────────────────────────
+
 /**
- * Run a full evaluation cycle across ALL recent time buckets.
+ * Handle adaptive anomaly detection for a single service.
  *
- * Uses SCAN (never KEYS) to iterate bucket keys safely in production.
- * Only processes buckets within the active TTL window — stale/expired
- * historical buckets are skipped.
+ * Uses the EWMA baseline (already updated earlier in the cycle)
+ * to detect when the current error rate significantly exceeds
+ * what the system has learned as "normal" for this service.
+ *
+ * Has its own cooldown namespace (alert:cd:adp:{service}) so it
+ * operates completely independently of threshold alerts.
+ *
+ * @param {import('ioredis').Redis} redis
+ * @param {string} service
+ * @param {number} errorRate — current error rate (%)
+ * @param {number} total — total logs in window
+ * @param {number} errors — error logs in window
+ * @param {number} windowSeconds — window size
+ * @param {{ baseline: number, previousBaseline: number, samples: number }} ewmaResult
+ * @returns {Promise<void>}
+ */
+async function handleAdaptiveAlert(redis, service, errorRate, total, errors, windowSeconds, ewmaResult) {
+  const { baseline, samples } = ewmaResult;
+
+  // ── Anomaly detection (3 safety guards checked inside) ────
+  const anomaly = detectAnomaly(errorRate, baseline, samples);
+
+  if (!anomaly.isAnomaly) {
+    // Log the reason for transparency
+    console.log(
+      `   🔬 [${service}] adaptive: ${anomaly.reason} — no anomaly`
+    );
+    return;
+  }
+
+  // ── Check adaptive cooldown ───────────────────────────────
+  // Separate namespace from threshold cooldowns — the two systems
+  // never interfere with each other.
+  const adaptiveCdKey = getAdaptiveCooldownKey(service);
+  const existingAdaptiveCd = await redis.get(adaptiveCdKey);
+
+  if (existingAdaptiveCd) {
+    console.log(
+      `   🔇 [${service}] ANOMALY alert suppressed — adaptive cooldown active (TTL=${await redis.ttl(adaptiveCdKey)}s)`
+    );
+    return;
+  }
+
+  // ── Build and persist adaptive alert document ─────────────
+  const now = new Date().toISOString();
+
+  const alertDoc = {
+    service,
+    severity:             'ANOMALY',
+    errorRate:            parseFloat(errorRate.toFixed(4)),
+    totalLogs:            total,
+    errorLogs:            errors,
+    timestamp:            now,
+    alertType:            'adaptive_deviation',
+    dataSource:           'sliding_window',
+    windowSeconds,
+    ewmaBaseline:         parseFloat(baseline.toFixed(6)),
+    deviationMultiplier:  parseFloat(anomaly.deviation.toFixed(4)),
+    evaluatedAt:          now,
+  };
+
+  try {
+    const result = await insertAlert(alertDoc);
+    console.log(
+      `   🔬 ANOMALY [${service}] rate=${errorRate.toFixed(2)}% baseline=${baseline.toFixed(2)}% ` +
+      `deviation=${anomaly.deviation.toFixed(2)}× — persisted as ${result.insertedId}`
+    );
+  } catch (dbErr) {
+    console.error(
+      `   ❌ Failed to persist adaptive alert for [${service}]:`, dbErr.message
+    );
+    return; // Don't set cooldown if persistence failed — allows retry
+  }
+
+  // ── Set adaptive cooldown ─────────────────────────────────
+  await redis.set(
+    adaptiveCdKey,
+    'ANOMALY',
+    'EX',
+    config.ewma.adaptiveCooldownSeconds
+  );
+
+  console.log(
+    `   🔕 Adaptive cooldown set: ${adaptiveCdKey} = ANOMALY (TTL=${config.ewma.adaptiveCooldownSeconds}s)`
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Core Evaluation Logic
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Evaluate a single service — runs BOTH threshold and adaptive paths.
+ *
+ * Flow:
+ *   1. Defensive cleanup of stale ZSET entries
+ *   2. Get rolling metrics (ZCOUNT-based, O(log N))
+ *   3. Check minimum request threshold
+ *   4. Compute error rate
+ *   5. UPDATE EWMA BASELINE (always — learns from every meaningful window)
+ *   6. THRESHOLD ALERTING (fixed thresholds with escalation)
+ *   7. ADAPTIVE ANOMALY ALERTING (EWMA deviation detection)
+ *
+ * Steps 5-7 ALWAYS run — there are no early returns after the error
+ * rate is computed. This ensures the EWMA baseline continuously
+ * learns regardless of whether any alerts fire.
+ *
+ * @param {import('ioredis').Redis} redis
+ * @param {string} service — service name
+ * @returns {Promise<void>}
+ */
+async function evaluateService(redis, service) {
+  // ── 1. Defensive cleanup ─────────────────────────────────
+  // Remove entries older than the window, in case the service
+  // stopped sending logs and no insert-time cleanup ran.
+  await cleanupWindow(redis, service);
+
+  // ── 2. Get rolling metrics ────────────────────────────────
+  // ZCOUNT-based: O(log N) for both total and error counts.
+  const metrics = await getRollingMetrics(redis, service);
+  const { total, errors, windowSeconds } = metrics;
+
+  // Empty window = no recent events (service went idle)
+  if (total === 0) {
+    return;
+  }
+
+  // ── 3. Minimum request threshold ─────────────────────────
+  // Don't evaluate services with too few requests in the window.
+  // Also don't update EWMA with noisy low-sample data — a window
+  // with 5 requests where 1 is an error (20%) would poison the baseline.
+  if (total < config.alerting.minRequestThreshold) {
+    console.log(
+      `   ⏭️  [${service}] total=${total} < ${config.alerting.minRequestThreshold} min threshold (window=${windowSeconds}s) — skipping`
+    );
+    return;
+  }
+
+  // ── 4. Compute error rate ─────────────────────────────────
+  const errorRate = (errors / total) * 100;
+
+  // ── 5. Update EWMA baseline (ALWAYS runs) ─────────────────
+  // The baseline learns from every evaluation cycle where we have
+  // enough traffic. This happens regardless of whether any alert
+  // fires — the system is always learning "normal" behavior.
+  let ewmaResult;
+  try {
+    ewmaResult = await updateBaseline(redis, service, errorRate);
+    console.log(
+      `   📊 EWMA [${service}] rate=${errorRate.toFixed(2)}% ` +
+      `baseline=${ewmaResult.previousBaseline.toFixed(2)}→${ewmaResult.baseline.toFixed(2)}% ` +
+      `samples=${ewmaResult.samples} α=${config.ewma.alpha}`
+    );
+  } catch (ewmaErr) {
+    // EWMA update failure must NOT block threshold alerts.
+    // Log and continue — threshold alerting is more critical.
+    console.error(
+      `   ⚠️  EWMA update failed for [${service}]:`, ewmaErr.message
+    );
+    ewmaResult = null;
+  }
+
+  // ── 6. Path 1: Fixed threshold alerting ───────────────────
+  // Exact same logic as Phase 2A, now in a named helper function.
+  // Has its own cooldown: alert:cd:{service}
+  try {
+    await handleThresholdAlert(redis, service, errorRate, total, errors, windowSeconds);
+  } catch (threshErr) {
+    console.error(
+      `   ❌ Threshold alert handling failed for [${service}]:`, threshErr.message
+    );
+  }
+
+  // ── 7. Path 2: Adaptive anomaly alerting ──────────────────
+  // Only runs if EWMA was updated successfully.
+  // Has its own cooldown: alert:cd:adp:{service}
+  if (ewmaResult) {
+    try {
+      await handleAdaptiveAlert(redis, service, errorRate, total, errors, windowSeconds, ewmaResult);
+    } catch (adaptiveErr) {
+      console.error(
+        `   ❌ Adaptive alert handling failed for [${service}]:`, adaptiveErr.message
+      );
+    }
+  }
+
+  // ── 8. Path 3: Latency percentiles (Phase 5A — logging only) ─
+  // Compute P50/P95/P99 for all latency types. No alerting yet —
+  // that comes in Phase 5B. This path validates the latency pipeline
+  // and provides visibility into service performance.
+  try {
+    await cleanupLatencyWindows(redis, service);
+    const latencyMetrics = await computePercentiles(redis, service);
+
+    if (latencyMetrics) {
+      // Log each latency type that has data
+      for (const [field, metrics] of Object.entries(latencyMetrics)) {
+        if (metrics) {
+          console.log(
+            `   📐 [${service}] ${field}: ` +
+            `P50=${metrics.p50}ms P95=${metrics.p95}ms P99=${metrics.p99}ms ` +
+            `(min=${metrics.min}ms max=${metrics.max}ms samples=${metrics.samples})`
+          );
+        }
+      }
+    }
+  } catch (latErr) {
+    console.error(
+      `   ⚠️  Latency percentile calc failed for [${service}]:`, latErr.message
+    );
+  }
+}
+
+/**
+ * Run a full evaluation cycle across ALL registered services.
+ *
+ * Uses the sw:services registry SET for service discovery —
+ * no SCAN needed. For each service, reads rolling metrics via
+ * ZCOUNT, updates EWMA, and runs both alert paths.
  *
  * @param {import('ioredis').Redis} redis
  * @returns {Promise<void>}
  */
-async function evaluateAllBuckets(redis) {
-  const prefix = config.timeBucket.keyPrefix;
-  const pattern = `${prefix}:*`;
+async function evaluateAllServices(redis) {
+  console.log('\n🔍 Alert evaluator — scanning sliding windows…');
 
-  console.log('\n🔍 Alert evaluator — scanning buckets…');
+  // ── Discover services from registry ───────────────────────
+  const services = await getServiceRegistry(redis);
 
-  let cursor = '0';
-  let bucketsScanned = 0;
-  let bucketsEvaluated = 0;
-  let bucketsSkippedStale = 0;
+  if (!services || services.length === 0) {
+    console.log('   ℹ️  No services registered in sw:services — nothing to evaluate');
+    console.log('🔍 Evaluation complete — services=0\n');
+    return;
+  }
 
-  // SCAN loop — iterates through all matching keys in batches
-  do {
-    // SCAN cursor MATCH pattern COUNT hint
-    // COUNT is a hint, not a guarantee — Redis may return more or fewer
-    const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 200);
-    cursor = nextCursor;
+  console.log(`   📋 Services registered: [${services.join(', ')}]`);
 
-    for (const key of keys) {
-      bucketsScanned++;
+  let evaluated = 0;
 
-      // Parse the key to extract service and minute
-      const parsed = parseBucketKey(key);
-      if (!parsed) {
-        console.log(`   ⚠️  Skipping unparseable key: ${key}`);
-        continue;
-      }
-
-      const { service, minute } = parsed;
-
-      // ── Filter: only evaluate recent buckets ──────────────
-      // Skip buckets older than the TTL window to avoid processing
-      // stale historical data unnecessarily.
-      if (!isBucketRecent(minute)) {
-        bucketsSkippedStale++;
-        console.log(`   ⏩ [${service}] bucket ${minute} is stale — skipping`);
-        continue;
-      }
-
-      bucketsEvaluated++;
-
-      try {
-        await evaluateBucket(redis, key, service, minute);
-      } catch (bucketErr) {
-        // Per-bucket failure: log and continue to next bucket
-        console.error(`   ❌ Error evaluating [${key}]:`, bucketErr.message);
-      }
+  for (const service of services) {
+    try {
+      await evaluateService(redis, service);
+      evaluated++;
+    } catch (serviceErr) {
+      // Per-service failure: log and continue to next service
+      console.error(`   ❌ Error evaluating [${service}]:`, serviceErr.message);
     }
-  } while (cursor !== '0');
+  }
 
   console.log(
-    `🔍 Evaluation complete — scanned=${bucketsScanned} evaluated=${bucketsEvaluated} stale_skipped=${bucketsSkippedStale}\n`
+    `🔍 Evaluation complete — services=${services.length} evaluated=${evaluated}\n`
   );
 }
 
@@ -335,11 +486,11 @@ async function evaluateAllBuckets(redis) {
 /**
  * Start the periodic alert evaluation loop.
  *
- * Runs evaluateAllBuckets() on a fixed interval (default 30s).
+ * Runs evaluateAllServices() on a fixed interval (default 30s).
  * Returns the interval ID so the caller can clear it on shutdown.
  *
  * The first evaluation is slightly delayed (5s) to let the worker
- * finish startup and begin processing logs before we scan buckets.
+ * finish startup and begin processing logs before we scan windows.
  *
  * @param {import('ioredis').Redis} redis
  * @returns {NodeJS.Timeout} — interval ID for cleanup
@@ -352,20 +503,22 @@ function startAlertEvaluator(redis) {
     `(thresholds: WARNING≥${config.alerting.thresholds.WARNING}%, ` +
     `CRITICAL≥${config.alerting.thresholds.CRITICAL}%, ` +
     `SEVERE≥${config.alerting.thresholds.SEVERE}%) ` +
+    `(EWMA: α=${config.ewma.alpha}, deviation≥${config.ewma.deviationThreshold}×, ` +
+    `floor=${config.ewma.baselineFloor}%, cold-start=${config.ewma.minSamples} cycles) ` +
     `(min requests: ${config.alerting.minRequestThreshold}) ` +
-    `(cooldown: ${config.alerting.cooldownSeconds}s)`
+    `(cooldowns: threshold=${config.alerting.cooldownSeconds}s, adaptive=${config.ewma.adaptiveCooldownSeconds}s)`
   );
 
   // Slight delay before first evaluation — let the worker warm up
   setTimeout(() => {
-    evaluateAllBuckets(redis).catch((err) => {
+    evaluateAllServices(redis).catch((err) => {
       console.error('❌ Alert evaluation cycle failed:', err.message);
     });
   }, 5000);
 
   // Periodic evaluation
   const intervalId = setInterval(() => {
-    evaluateAllBuckets(redis).catch((err) => {
+    evaluateAllServices(redis).catch((err) => {
       console.error('❌ Alert evaluation cycle failed:', err.message);
     });
   }, intervalMs);
@@ -378,11 +531,9 @@ function startAlertEvaluator(redis) {
 // ─────────────────────────────────────────────────────────────
 
 module.exports = {
-  evaluateAllBuckets,
+  evaluateAllServices,
   startAlertEvaluator,
   computeSeverity,
   getCooldownKey,
-  parseBucketKey,
-  isBucketRecent,
   SEVERITY_RANK,
 };

@@ -5,9 +5,14 @@
  * ready for MongoDB insertion.
  *
  * Redis Stream entries come as flat key-value arrays:
- *   ['service', 'auth', 'message', 'hello', ...]
+ *   ['service', 'auth', 'message', 'hello', ...]\
  *
  * After ioredis parsing they arrive as arrays of [id, [field, value, ...]].
+ *
+ * APM fields (Phase 5A) are parsed when present:
+ *   responseTime, dbQueryTime, externalApiTime  → parseFloat (ms)
+ *   endpoint → string
+ *   statusCode → parseInt
  *
  * @param {string} entryId   — Redis Stream entry ID (e.g. "1713900000000-0")
  * @param {string[]} fields  — flat array of alternating key/value pairs
@@ -34,6 +39,15 @@ function normaliseLog(entryId, fields) {
     timestamp,
     processedAt: new Date().toISOString(),
     _streamId: entryId, // keep a reference back to the Redis entry
+
+    // ── Optional APM fields (Phase 5A) ──────────────────
+    // Parsed safely: null when absent, numeric when present.
+    // These flow through to MongoDB and to latencyAggregator.
+    responseTime:    raw.responseTime    ? parseFloat(raw.responseTime)    : null,
+    dbQueryTime:     raw.dbQueryTime     ? parseFloat(raw.dbQueryTime)     : null,
+    externalApiTime: raw.externalApiTime ? parseFloat(raw.externalApiTime) : null,
+    endpoint:        raw.endpoint        || null,
+    statusCode:      raw.statusCode      ? parseInt(raw.statusCode, 10)   : null,
   };
 }
 

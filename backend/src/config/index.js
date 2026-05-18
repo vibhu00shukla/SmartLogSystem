@@ -47,6 +47,43 @@ const config = {
       SEVERE:   parseFloat(process.env.ALERT_SEVERE_PCT) || 10,
     },
   },
+
+  // ── Sliding Window Analytics (Phase 3) ────────────────
+  // Rolling 60-second windows using Redis Sorted Sets.
+  // Coexists with fixed-minute time buckets — both are written.
+  slidingWindow: {
+    keyPrefix: process.env.SW_KEY_PREFIX || 'sw',                  // ZSET key prefix
+    errorSuffix: process.env.SW_ERROR_SUFFIX || ':err',            // suffix for error-only ZSET
+    serviceRegistryKey: process.env.SW_REGISTRY_KEY || 'sw:services', // SET of active service names
+    windowSeconds: parseInt(process.env.SW_WINDOW_SECONDS, 10) || 60, // rolling window size in seconds
+  },
+
+  // ── EWMA Adaptive Baselines (Phase 4) ──────────────────
+  // Exponentially Weighted Moving Average for per-service baseline
+  // error rates. Augments fixed-threshold alerting with adaptive
+  // anomaly detection that learns "normal" behavior.
+  ewma: {
+    alpha: parseFloat(process.env.EWMA_ALPHA) || 0.5,                              // smoothing factor (0-1)
+    keyPrefix: process.env.EWMA_KEY_PREFIX || 'ewma',                              // Redis hash key prefix
+    minSamples: parseInt(process.env.EWMA_MIN_SAMPLES, 10) || 5,                   // cold-start: min cycles before adaptive alerts
+    deviationThreshold: parseFloat(process.env.EWMA_DEVIATION_THRESHOLD) || 3,     // fire anomaly when current >= Nx baseline
+    minAbsoluteRate: parseFloat(process.env.EWMA_MIN_ABSOLUTE_RATE) || 1,          // minimum error rate (%) to fire anomaly
+    baselineFloor: parseFloat(process.env.EWMA_BASELINE_FLOOR) || 0.5,            // minimum baseline to prevent div-by-zero
+    adaptiveCooldownPrefix: process.env.EWMA_CD_PREFIX || 'alert:cd:adp',         // adaptive cooldown key prefix
+    adaptiveCooldownSeconds: parseInt(process.env.EWMA_CD_SECONDS, 10) || 300,    // adaptive cooldown TTL
+  },
+
+  // ── Latency Analytics (Phase 5A) ──────────────────────
+  // Per-service latency sliding windows using Redis Sorted Sets.
+  // Stores latency samples for percentile computation (P50/P95/P99).
+  latency: {
+    keyPrefixes: {
+      responseTime:    process.env.LAT_RESP_PREFIX    || 'lat:resp',   // response time ZSET prefix
+      dbQueryTime:     process.env.LAT_DB_PREFIX      || 'lat:db',     // DB query time ZSET prefix
+      externalApiTime: process.env.LAT_EXT_PREFIX     || 'lat:ext',    // external API time ZSET prefix
+    },
+    windowSeconds: parseInt(process.env.LAT_WINDOW_SECONDS, 10) || 60,  // rolling window for latency samples
+  },
 };
 
 module.exports = config;

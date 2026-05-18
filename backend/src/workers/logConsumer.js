@@ -4,6 +4,8 @@ const config = require('../config');
 const { normaliseLog } = require('./logNormaliser');
 const { insertLog } = require('../db/mongo');
 const { updateBucket } = require('../services/bucketAggregator');
+const { recordEvent } = require('../services/slidingWindowAggregator');
+const { recordLatency } = require('../services/latencyAggregator');
 
 /**
  * Ensure the consumer group exists on the stream.
@@ -84,6 +86,25 @@ async function processLogs(redis) {
             await updateBucket(redis, logDoc);
           } catch (bucketErr) {
             console.error(`⚠️  Bucket update failed [${entryId}]:`, bucketErr.message);
+          }
+
+          // ── Update sliding window (best-effort) ────────────
+          // Records this event into per-service Redis ZSETs for
+          // rolling 60-second analytics. Independent of bucket writes.
+          try {
+            await recordEvent(redis, logDoc);
+          } catch (swErr) {
+            console.error(`⚠️  Sliding window update failed [${entryId}]:`, swErr.message);
+          }
+
+          // ── Record latency samples (best-effort) ────────────
+          // Stores latency values into per-service Redis ZSETs for
+          // percentile computation. Only writes when APM fields are
+          // present — skips entirely for logs without latency data.
+          try {
+            await recordLatency(redis, logDoc);
+          } catch (latErr) {
+            console.error(`⚠️  Latency recording failed [${entryId}]:`, latErr.message);
           }
 
           // ── ACK only after successful insert ───────────────
